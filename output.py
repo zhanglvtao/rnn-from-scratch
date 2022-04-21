@@ -11,5 +11,6 @@ class Softmax:
 
     def diff(self, x, y):
         probs = self.predict(x)
+        #print("len(probs) %s\n" % len(probs))
         probs[y] -= 1.0
         return probs

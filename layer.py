@@ -1,5 +1,6 @@
 from activation import Tanh
 from gate import AddGate, MultiplyGate
+from mkvcli import MKV
 
 mulGate = MultiplyGate()
 addGate = AddGate()
@@ -12,6 +13,13 @@ class RNNLayer:
         self.add = addGate.forward(self.mulw, self.mulu)
         self.s = activation.forward(self.add)
         self.mulv = mulGate.forward(V, self.s)
+    
+    def forward0(self, input_k, prev_s_k, u_k, w_k, v_k):
+        self.mulu = mulGate.forward0(u_k, input_k)
+        self.mulw = mulGate.forward0(w_k, prev_s_k)
+        self.add = addGate.forward(self.mulw, self.mulu)
+        self.s = activation.forward(self.add)
+        self.mulv = mulGate.forward(MKV.Get(v_k), self.s)
 
     def backward(self, x, prev_s, U, W, V, diff_s, dmulv):
         self.forward(x, prev_s, U, W, V)

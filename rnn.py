@@ -1,36 +1,52 @@
 from datetime import datetime
+from mkvcli import MkvClient
 import numpy as np
 import sys
 from layer import RNNLayer
 from output import Softmax
-
+from mkvcli import MKV
 
 class Model:
-    def __init__(self, word_dim, hidden_dim=100, bptt_truncate=4):
+    def __init__(self, word_dim, hidden_dim=100, bptt_truncate=4, learning_rate=0.005):
         self.word_dim = word_dim
         self.hidden_dim = hidden_dim
         self.bptt_truncate = bptt_truncate
+        self.learning_rate = learning_rate
         self.U = np.random.uniform(-np.sqrt(1. / word_dim), np.sqrt(1. / word_dim), (hidden_dim, word_dim))
         self.W = np.random.uniform(-np.sqrt(1. / hidden_dim), np.sqrt(1. / hidden_dim), (hidden_dim, hidden_dim))
         self.V = np.random.uniform(-np.sqrt(1. / hidden_dim), np.sqrt(1. / hidden_dim), (word_dim, hidden_dim))
+        self.U_k = "rnn-u"
+        self.W_k = "rnn-w"
+        self.V_k = "rnn-v"
+        # store model to mkv
+        MKV.Put(self.U_k, self.U, 60)
+        MKV.Put(self.W_k, self.W, 60)
+        MKV.Put(self.V_k, self.V, 60)
+        # store all word vector to mkv
+        WORD = "word"
+        for i in range(word_dim):
+            word = np.zeros(self.word_dim)
+            word[i] = 1
+            MKV.Put("{}{}".format(WORD, i), word, 60)
+
 
     '''
         forward propagation (predicting word probabilities)
         x is one single data, and a batch of data
         for example x = [0, 179, 341, 416], then its y = [179, 341, 416, 1]
     '''
-    def forward_propagation(self, x):
+    def forward_propagation(self, xi):
         # The total number of time steps
-        T = len(x)
+        T = len(xi)
         layers = []
-        prev_s = np.zeros(self.hidden_dim)
+        prev_s_k = "prev_s"
+        MKV.Put(prev_s_k, np.zeros(self.hidden_dim))
         # For each time step...
         for t in range(T):
             layer = RNNLayer()
-            input = np.zeros(self.word_dim)
-            input[x[t]] = 1
-            layer.forward(input, prev_s, self.U, self.W, self.V)
-            prev_s = layer.s
+            word_key = "word{}".format(xi[t])
+            layer.forward0(word_key, prev_s_k, self.U_k, self.W_k, self.V_k)
+            MKV.Put(prev_s_k, layer.s)
             layers.append(layer)
         return layers
 
@@ -39,20 +55,57 @@ class Model:
         layers = self.forward_propagation(x)
         return [np.argmax(output.predict(layer.mulv)) for layer in layers]
 
-    def calculate_loss(self, x, y):
-        assert len(x) == len(y)
+    def calculate_loss(self, xi, yi):
+        assert len(xi) == len(yi)
         output = Softmax()
-        layers = self.forward_propagation(x)
+        layers = self.forward_propagation(xi)
+        self.sgd_step0(layers, output, xi, yi, self.learning_rate)
         loss = 0.0
         for i, layer in enumerate(layers):
-            loss += output.loss(layer.mulv, y[i])
-        return loss / float(len(y))
+            loss += output.loss(layer.mulv, yi[i])
+        return loss / float(len(yi))
 
     def calculate_total_loss(self, X, Y):
         loss = 0.0
         for i in range(len(Y)):
             loss += self.calculate_loss(X[i], Y[i])
         return loss / float(len(Y))
+    
+    def bptt0(self, layers, output, x, y):
+        dU = np.zeros(self.U.shape)
+        dV = np.zeros(self.V.shape)
+        dW = np.zeros(self.W.shape)
+
+        T = len(layers)
+        prev_s_t = np.zeros(self.hidden_dim)
+        diff_s = np.zeros(self.hidden_dim)
+        for t in range(0, T):
+            dmulv = output.diff(layers[t].mulv, y[t])
+            input = np.zeros(self.word_dim)
+            input[x[t]] = 1
+            dprev_s, dU_t, dW_t, dV_t = layers[t].backward(input, prev_s_t, self.U, self.W, self.V, diff_s, dmulv)
+            prev_s_t = layers[t].s
+            dmulv = np.zeros(self.word_dim)
+            for i in range(t-1, max(-1, t-self.bptt_truncate-1), -1):
+                input = np.zeros(self.word_dim)
+                input[x[i]] = 1
+                prev_s_i = np.zeros(self.hidden_dim) if i == 0 else layers[i-1].s
+                dprev_s, dU_i, dW_i, dV_i = layers[i].backward(input, prev_s_i, self.U, self.W, self.V, dprev_s, dmulv)
+                dU_t += dU_i
+                dW_t += dW_i
+            dV += dV_t
+            dU += dU_t
+            dW += dW_t
+        return (dU, dW, dV) 
+    
+    def sgd_step0(self, layers, output, x, y, learning_rate):
+        dU, dW, dV = self.bptt0(layers, output, x, y)
+        self.U -= learning_rate * dU
+        self.V -= learning_rate * dV
+        self.W -= learning_rate * dW
+        MKV.Put(self.U_k, self.U, 50)
+        MKV.Put(self.V_k, self.V, 60)
+        MKV.Put(self.W_k, self.W, 60)
 
     def bptt(self, x, y):
         assert len(x) == len(y)
@@ -93,10 +146,12 @@ class Model:
     def train(self, X, Y, learning_rate=0.005, nepoch=100, evaluate_loss_after=5):
         num_examples_seen = 0
         losses = []
+        self.learning_rate = learning_rate
         for epoch in range(nepoch):
             if (epoch % evaluate_loss_after == 0):
                 loss = self.calculate_total_loss(X, Y)
                 losses.append((num_examples_seen, loss))
+                num_examples_seen += 1
                 time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 print("%s: Loss after num_examples_seen=%d epoch=%d: %f" % (time, num_examples_seen, epoch, loss))
                 # Adjust the learning rate if loss increases
@@ -105,7 +160,7 @@ class Model:
                     print("Setting learning rate to %f" % learning_rate)
                 sys.stdout.flush()
             # For each training example...
-            for i in range(len(Y)):
-                self.sgd_step(X[i], Y[i], learning_rate)
-                num_examples_seen += 1
+            # for i in range(len(Y)):
+            #    self.sgd_step(X[i], Y[i], learning_rate)
+            #       num_examples_seen += 1
         return losses
